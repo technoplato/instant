@@ -598,6 +598,58 @@
               (is (= :refresh-ok (:op ret)))
               (is (contains? ret :attrs)))))))))
 
+(deftest refresh-delta
+  (with-movies-app
+    (fn [{app-id :id :as _app} r]
+      (with-session
+        (fn [store {{sess-id :id :as socket} :socket
+                    {sess-id-2 :id :as socket-2} :socket-2}]
+          (send-msg socket {:op :init
+                            :app-id app-id
+                            :versions {session/core-version-key "v0.22.75"}
+                            :features ["refresh-delta"]})
+          (is (= :init-ok (:op (read-msg socket))))
+          (send-msg socket-2 {:op :init
+                              :app-id app-id
+                              :versions {session/core-version-key "v0.22.75"}})
+          (is (= :init-ok (:op (read-msg socket-2))))
+          (let [robocop-eid (resolvers/->uuid r "eid-robocop")
+                title-attr-id (resolvers/->uuid r :movie/title)
+                q (:kw-q query-1987)
+                {base-version :version} (blocking-send-msg :add-query-ok socket {:op :add-query :q q})
+                _ (blocking-send-msg :add-query-ok socket-2 {:op :add-query :q q})
+                refresh! (fn [socket sess-id]
+                           (rs/mark-stale-topics! store
+                                                  app-id
+                                                  0
+                                                  (instant.isn/test-isn 0)
+                                                  [(d/pat->coarse-topic [:ea robocop-eid])]
+                                                  {})
+                           (send-msg socket {:session-id sess-id :op :refresh})
+                           (read-msg socket))
+                e+a+v (fn [triples] (set (map #(vec (take 3 %)) triples)))]
+            (is (number? base-version))
+            (blocking-send-msg :transact-ok
+                               socket
+                               {:op :transact
+                                :tx-steps [["add-triple" robocop-eid title-attr-id "RoboDrizzle"]]})
+
+            (testing "a session that asked for deltas gets only what changed"
+              (let [{[computation] :computations :as ret} (refresh! socket sess-id)
+                    delta (:instaql-delta computation)]
+                (is (= :refresh-ok (:op ret)))
+                (is (not (contains? computation :instaql-result)))
+                (is (= base-version (:base-version delta)))
+                (is (< base-version (:version computation)))
+                (is (= #{[robocop-eid title-attr-id "RoboDrizzle"]} (e+a+v (:added delta))))
+                (is (= #{[robocop-eid title-attr-id "RoboCop"]} (e+a+v (:removed delta))))))
+
+            (testing "a session that did not ask still gets the whole result"
+              (let [{[computation] :computations} (refresh! socket-2 sess-id-2)]
+                (is (contains? computation :instaql-result))
+                (is (not (contains? computation :instaql-delta)))
+                (is (not (contains? computation :version)))))))))))
+
 (deftest refresh-sends-attrs-when-schema-changes-without-queries
   (with-session
     (fn [_store {:keys [socket movies-app-id]}]
