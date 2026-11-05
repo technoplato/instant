@@ -123,6 +123,15 @@
 (defn supports-batch-messages? [features]
   (contains? features :batch-messages))
 
+(defn supports-refresh-delta? [features]
+  (contains? features :refresh-delta))
+
+(defn- requested-features
+  "Features a client asks for by name at init, beyond what its version implies."
+  [event]
+  (cond-> #{}
+    (some #{"refresh-delta"} (:features event)) (conj :refresh-delta)))
+
 (defn auth-and-creator-attrs [auth creator versions]
   (cond-> {:app-id (-> auth :app :id)
            :app-title (-> auth :app :title)
@@ -171,7 +180,7 @@
         auth        {:app    app
                      :user   user
                      :admin? admin?}
-        features (get-supported-features versions)]
+        features (into (get-supported-features versions) (requested-features event))]
     (tracer/add-data! {:attributes (auth-and-creator-attrs auth creator versions)})
     (apply rs/assoc-session! store sess-id
            :session/auth auth
@@ -231,6 +240,38 @@
     :read-replica
     :read))
 
+(defn- join-rows-triples
+  "The triples of a join-rows result, which collect-instaql-results-for-client
+   gathers into a single join row. Nil for any other result."
+  [instaql-result]
+  (let [triples (-> instaql-result first :data :datalog-result :join-rows first)]
+    (when (set? triples)
+      triples)))
+
+(defn- delta-computation
+  "For a :refresh-delta session, replaces a join-rows result with the triples
+   it gained and lost since the version the session was last sent, when that
+   is smaller. The client applies it only to the result it holds at
+   :base-version; any other result asks for a fresh subscription."
+  [store app-id sess-id {:keys [instaql-query instaql-result version] :as computation}]
+  (if-let [triples (join-rows-triples instaql-result)]
+    (let [{prev :triples base-version :version}
+          (rs/record-instaql-query-sent! store app-id sess-id instaql-query version triples)
+          added (when prev (into [] (remove prev) triples))
+          removed (when prev (into [] (remove triples) prev))]
+      (if (or (nil? prev)
+              (>= (+ (count added) (count removed)) (count triples)))
+        computation
+        (let [{:keys [page-info aggregate]} (-> instaql-result first :data)]
+          (-> computation
+              (dissoc :instaql-result)
+              (assoc :instaql-delta (cond-> {:base-version base-version
+                                             :added added
+                                             :removed removed}
+                                      page-info (assoc :page-info page-info)
+                                      aggregate (assoc :aggregate aggregate)))))))
+    computation))
+
 (defn- handle-add-query! [store sess-id {:keys [q client-event-id return-type] :as _event}]
   (let [{:keys [app user admin?]} (get-auth! store sess-id)
         {app-id :id} app
@@ -259,15 +300,20 @@
                  :table-info     table-info
                  :admin?         admin?
                  :current-user   user}
-            {:keys [session/inference?]} (rs/session store sess-id)
-            {:keys [instaql-result result-meta]} (rq/instaql-query-reactive! store ctx q return-type inference?)]
-        (rs/send-event! store app-id sess-id {:op :add-query-ok
-                                              :q q
-                                              :result instaql-result
-                                              :result-meta result-meta
-                                              :processed-tx-id processed-tx-id
-                                              :processed-isn processed-isn
-                                              :client-event-id client-event-id})))))
+            {:keys [session/inference? session/features]} (rs/session store sess-id)
+            {:keys [instaql-result result-meta version]} (rq/instaql-query-reactive! store ctx q return-type inference?)
+            delta-triples (when (supports-refresh-delta? features)
+                            (join-rows-triples instaql-result))]
+        (when delta-triples
+          (rs/record-instaql-query-sent! store app-id sess-id q version delta-triples))
+        (rs/send-event! store app-id sess-id (cond-> {:op :add-query-ok
+                                                      :q q
+                                                      :result instaql-result
+                                                      :result-meta result-meta
+                                                      :processed-tx-id processed-tx-id
+                                                      :processed-isn processed-isn
+                                                      :client-event-id client-event-id}
+                                               delta-triples (assoc :version version)))))))
 
 (defn- handle-start-sync! [store sess-id {:keys [q client-event-id op] :as _event}]
   (let [{:keys [app user admin?]} (get-auth! store sess-id)
@@ -453,7 +499,7 @@
              :admin? admin?}
         start-ms (System/currentTimeMillis)
         {:keys [session/inference?]} (rs/session store sess-id)
-        {:keys [instaql-result result-meta result-changed? instaql-topic?]}
+        {:keys [instaql-result result-meta result-changed? instaql-topic? version]}
         (rq/instaql-query-reactive! store ctx query return-type inference?)
         end-ms (System/currentTimeMillis)]
     {:instaql-query query
@@ -461,6 +507,7 @@
      :instaql-result instaql-result
      :result-meta result-meta
      :result-changed? result-changed?
+     :version version
      :duration-ms (- end-ms start-ms)
      :instaql-topic? instaql-topic?}))
 
@@ -502,7 +549,10 @@
          features :session/features} (rs/session store sess-id)
         can-skip-attrs? (supports-skip-attrs? features)
         attrs-hash      (hash attrs)
-        attrs-changed?  (not= prev-attrs-hash attrs-hash)]
+        attrs-changed?  (not= prev-attrs-hash attrs-hash)
+        computations    (if (supports-refresh-delta? features)
+                          (mapv (partial delta-computation store app-id sess-id) computations)
+                          (mapv #(dissoc % :version) computations))]
     (doseq [{:keys [instaql-query instaql-query-hash duration-ms instaql-topic?]} spam]
       (tracer/record-info! {:name "handle-refresh/spam"
                             :attributes {:app-id app-id

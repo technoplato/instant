@@ -96,6 +96,10 @@
     :db/unique :db.unique/identity}
    :instaql-query/return-type {} ;; :join-rows or :tree
    :instaql-query/topic {}
+   ;; For :refresh-delta sessions: the join-rows triples the session was last
+   ;; sent and the version of the computation that produced them
+   :instaql-query/sent-triples {}
+   :instaql-query/sent-version {:db/type :db.type/integer}
 
    :subscription/app-id {:db/type :db.type/integer}
    :subscription/session-id {:db/index true
@@ -674,6 +678,34 @@
                             (and (nil? hash-before)
                                  (nil? hash-after)))]
     (assoc report :result-changed? result-changed?)))
+
+(defn- record-instaql-query-sent-tx-data
+  "Should be used in a db.fn/call. Returns transactions.
+   Records the triples sent for a query, unless a newer version already
+   recorded its own."
+  [db lookup-ref version triples]
+  (if-some [ent (d/entity db lookup-ref)]
+    (if (< (or (:instaql-query/sent-version ent) 0) version)
+      [[:db/add (:db/id ent) :instaql-query/sent-version version]
+       [:db/add (:db/id ent) :instaql-query/sent-triples triples]]
+      [])
+    []))
+
+(defn record-instaql-query-sent!
+  "Records the triples a :refresh-delta session is sent for a query and returns
+   what it was sent before as {:version v :triples #{...}}, or nil when nothing
+   was recorded yet or a newer version already was."
+  [store app-id sess-id instaql-query version triples]
+  (let [lookup-ref [:instaql-query/session-id+query [sess-id instaql-query]]
+        report (transact! "store/record-instaql-query-sent!"
+                          (app-conn store app-id)
+                          [[:db.fn/call record-instaql-query-sent-tx-data lookup-ref version triples]])
+        before (d/entity (:db-before report) lookup-ref)
+        after (d/entity (:db-after report) lookup-ref)]
+    (when (and (= version (:instaql-query/sent-version after))
+               (:instaql-query/sent-version before))
+      {:version (:instaql-query/sent-version before)
+       :triples (:instaql-query/sent-triples before)})))
 
 ;; -------
 ;; streams
