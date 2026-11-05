@@ -598,6 +598,44 @@
               (is (= :refresh-ok (:op ret)))
               (is (contains? ret :attrs)))))))))
 
+(deftest admin-refresh-skip-attrs
+  ;; @instantdb/admin's subscribeQuery starts its session with admin-init!,
+  ;; not :init, and sends the same versions map.
+  (with-movies-app
+    (fn [{app-id :id :as app} r]
+      (with-session
+        (fn [store {{sess-id :id :as socket} :socket}]
+          (session/admin-init! store sess-id {:app app
+                                              :attrs (attr-model/get-by-app-id app-id)
+                                              :admin? true
+                                              :inference? false
+                                              :creator {:id (random-uuid)}
+                                              :versions {session/core-version-key "v1.0.65"}})
+
+          (blocking-send-msg :add-query-ok
+                             socket
+                             {:op :add-query
+                              :q (:kw-q query-1987)
+                              :return-type :tree})
+
+          (rs/mark-stale-topics! store
+                                 app-id
+                                 0
+                                 (instant.isn/test-isn 0)
+                                 [(d/pat->coarse-topic
+                                   [:ea
+                                    (resolvers/->uuid r "eid-predator")])]
+                                 {})
+          (ds/transact! (rs/app-conn store app-id)
+                        [[:db/retract [:instaql-query/session-id+query [sess-id (:kw-q query-1987)]] :instaql-query/hash]])
+
+          (testing "if attrs don't change, don't send them"
+            (send-msg socket {:session-id (:id socket)
+                              :op :refresh})
+            (let [ret (read-msg socket)]
+              (is (= :refresh-ok (:op ret)))
+              (is (not (contains? ret :attrs))))))))))
+
 (deftest refresh-sends-attrs-when-schema-changes-without-queries
   (with-session
     (fn [_store {:keys [socket movies-app-id]}]
