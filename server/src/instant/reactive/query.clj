@@ -209,6 +209,7 @@
          :result-meta (when (and materialize? (= :tree return-type))
                         (instaql-nodes->object-meta instaql-result))
          :result-changed? result-changed?
+         :version v
          :instaql-topic? (boolean iq-topic)})
       (catch Throwable e
         (rs/remove-query! store app-id session-id instaql-query)
