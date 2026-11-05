@@ -248,26 +248,47 @@
     (when (set? triples)
       triples)))
 
+(defn- triples-delta
+  "What a client holding `prev` needs to reach `triples`, applied in order:
+   drop every triple of each of :removed-entities (entities with nothing left
+   in the result), drop each of :removed, then add each of :added, where an
+   added value of a cardinality-one attribute replaces the entity's old value
+   for that attribute, so the old one is not sent."
+  [attrs prev triples]
+  (let [added (into [] (remove prev) triples)
+        replaced (into #{}
+                       (keep (fn [[e a]]
+                               (when (= :one (:cardinality (attr-model/seek-by-id a attrs)))
+                                 [e a])))
+                       added)
+        remaining-eids (into #{} (map first) triples)
+        {gone true removed false} (group-by (fn [[e]] (not (contains? remaining-eids e)))
+                                            (into []
+                                                  (comp (remove triples)
+                                                        (remove (fn [[e a]] (contains? replaced [e a]))))
+                                                  prev))]
+    {:added added
+     :removed (vec removed)
+     :removed-entities (into [] (comp (map first) (distinct)) gone)}))
+
 (defn- delta-computation
-  "For a :refresh-delta session, replaces a join-rows result with the triples
-   it gained and lost since the version the session was last sent, when that
-   is smaller. The client applies it only to the result it holds at
+  "For a :refresh-delta session, replaces a join-rows result with what it
+   gained and lost since the version the session was last sent (triples-delta),
+   when that is smaller. The client applies it only to the result it holds at
    :base-version; any other result asks for a fresh subscription."
-  [store app-id sess-id {:keys [instaql-query instaql-result version] :as computation}]
+  [store app-id sess-id attrs {:keys [instaql-query instaql-result version] :as computation}]
   (if-let [triples (join-rows-triples instaql-result)]
     (let [{prev :triples base-version :version}
           (rs/record-instaql-query-sent! store app-id sess-id instaql-query version triples)
-          added (when prev (into [] (remove prev) triples))
-          removed (when prev (into [] (remove triples) prev))]
+          {:keys [added removed removed-entities] :as delta} (when prev
+                                                               (triples-delta attrs prev triples))]
       (if (or (nil? prev)
-              (>= (+ (count added) (count removed)) (count triples)))
+              (>= (+ (count added) (count removed) (count removed-entities)) (count triples)))
         computation
         (let [{:keys [page-info aggregate]} (-> instaql-result first :data)]
           (-> computation
               (dissoc :instaql-result)
-              (assoc :instaql-delta (cond-> {:base-version base-version
-                                             :added added
-                                             :removed removed}
+              (assoc :instaql-delta (cond-> (assoc delta :base-version base-version)
                                       page-info (assoc :page-info page-info)
                                       aggregate (assoc :aggregate aggregate)))))))
     computation))
@@ -551,7 +572,7 @@
         attrs-hash      (hash attrs)
         attrs-changed?  (not= prev-attrs-hash attrs-hash)
         computations    (if (supports-refresh-delta? features)
-                          (mapv (partial delta-computation store app-id sess-id) computations)
+                          (mapv (partial delta-computation store app-id sess-id attrs) computations)
                           (mapv #(dissoc % :version) computations))]
     (doseq [{:keys [instaql-query instaql-query-hash duration-ms instaql-topic?]} spam]
       (tracer/record-info! {:name "handle-refresh/spam"
