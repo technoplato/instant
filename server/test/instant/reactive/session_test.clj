@@ -642,7 +642,19 @@
                 (is (= base-version (:base-version delta)))
                 (is (< base-version (:version computation)))
                 (is (= #{[robocop-eid title-attr-id "RoboDrizzle"]} (e+a+v (:added delta))))
-                (is (= #{[robocop-eid title-attr-id "RoboCop"]} (e+a+v (:removed delta))))))
+                (testing "a new value of a cardinality-one attribute replaces the old one unsent"
+                  (is (empty? (:removed delta))))))
+
+            (testing "an entity that leaves the result is named, not its triples"
+              (blocking-send-msg :transact-ok
+                                 socket
+                                 {:op :transact
+                                  :tx-steps [["add-triple" robocop-eid (resolvers/->uuid r :movie/year) 1988]]})
+              (let [{[computation] :computations} (refresh! socket sess-id)
+                    delta (:instaql-delta computation)]
+                (is (= [robocop-eid] (:removed-entities delta)))
+                (is (empty? (:removed delta)))
+                (is (empty? (:added delta)))))
 
             (testing "a session that did not ask still gets the whole result"
               (let [{[computation] :computations} (refresh! socket-2 sess-id-2)]
