@@ -121,26 +121,78 @@ const ignoreLogging = {
   'patch-presence': true,
 };
 
+const ATTRS_KEY = 'attrs';
+
+function hydrateAttrsStore(sharedAttrs, extraAttrs) {
+  if (!extraAttrs) {
+    return sharedAttrs;
+  }
+  return new s.AttrsStoreClass(
+    { ...sharedAttrs.attrs, ...extraAttrs },
+    sharedAttrs.linkIndex,
+  );
+}
+
+function diffExtraAttrs(resultAttrsStore, sharedAttrsStore) {
+  if (!resultAttrsStore || resultAttrsStore === sharedAttrsStore) {
+    return undefined;
+  }
+  const sharedAttrs = sharedAttrsStore.attrs;
+  let extraAttrs;
+  for (const [id, attr] of Object.entries(resultAttrsStore.attrs)) {
+    const shared = sharedAttrs[id];
+    if (shared !== attr && !areObjectsDeepEqual(shared, attr)) {
+      if (!extraAttrs) {
+        extraAttrs = {};
+      }
+      extraAttrs[id] = attr;
+    }
+  }
+  return extraAttrs;
+}
+
 /**
  * @param {QuerySubInStorage} x
  * @param {boolean | null} useDateObjects
+ * @param {() => s.AttrsStore | undefined} [getSharedAttrs]
  * @returns {QuerySub}
  */
-function querySubFromStorage(x, useDateObjects) {
+function querySubFromStorage(x, useDateObjects, getSharedAttrs) {
   const v = typeof x === 'string' ? JSON.parse(x) : x;
 
   if (v?.result?.store) {
-    const attrsStore = s.attrsStoreFromJSON(
+    const legacyAttrsStore = s.attrsStoreFromJSON(
       v.result.attrsStore,
       v.result.store,
     );
-    if (attrsStore) {
+    if (legacyAttrsStore) {
+      const storeJSON = v.result.store;
+      v.result.store = s.fromJSON(legacyAttrsStore, {
+        ...storeJSON,
+        useDateObjects: useDateObjects,
+      });
+      v.result.attrsStore = legacyAttrsStore;
+      return v;
+    }
+
+    const sharedAttrs = getSharedAttrs?.();
+    if (sharedAttrs) {
+      const attrsStore = hydrateAttrsStore(sharedAttrs, v.result.extraAttrs);
       const storeJSON = v.result.store;
       v.result.store = s.fromJSON(attrsStore, {
         ...storeJSON,
         useDateObjects: useDateObjects,
       });
       v.result.attrsStore = attrsStore;
+      delete v.result.extraAttrs;
+    } else {
+      v.result._rawStore = v.result.store;
+      if (v.result.extraAttrs) {
+        v.result._extraAttrs = v.result.extraAttrs;
+        delete v.result.extraAttrs;
+      }
+      v.result.store = null;
+      v.result.attrsStore = null;
     }
   }
 
@@ -151,22 +203,54 @@ function querySubFromStorage(x, useDateObjects) {
  *
  * @param {string} _key
  * @param {QuerySub} sub
+ * @param {() => s.AttrsStore | undefined} [getSharedAttrs]
  * @returns QuerySubInStorage
  */
-function querySubToStorage(_key, sub) {
+function querySubToStorage(_key, sub, getSharedAttrs) {
   const { result, ...rest } = sub;
   const jsonSub = /** @type {import('./reactorTypes.ts').QuerySubInStorage} */ (
     rest
   );
   if (result) {
-    /** @type {import('./reactorTypes.ts').QuerySubResultInStorage} */
-    const jsonResult = {
-      ...result,
-      store: s.toJSON(result.store),
-      attrsStore: result.attrsStore.toJSON(),
-    };
+    if (result._rawStore) {
+      const {
+        _rawStore,
+        _extraAttrs,
+        store: _store,
+        attrsStore: _attrsStore,
+        ...meta
+      } = result;
+      jsonSub.result = {
+        ...meta,
+        store: _rawStore,
+        ...(_extraAttrs ? { extraAttrs: _extraAttrs } : {}),
+      };
+      return jsonSub;
+    }
 
-    jsonSub.result = jsonResult;
+    const { store, attrsStore, ...meta } = result;
+    if (!store || !attrsStore) {
+      return jsonSub;
+    }
+    const sharedAttrs = getSharedAttrs?.();
+    if (sharedAttrs) {
+      const extraAttrs = diffExtraAttrs(attrsStore, sharedAttrs);
+      /** @type {import('./reactorTypes.ts').QuerySubResultInStorage} */
+      const jsonResult = {
+        ...meta,
+        store: s.toJSON(store),
+        ...(extraAttrs ? { extraAttrs } : {}),
+      };
+      jsonSub.result = jsonResult;
+    } else {
+      /** @type {import('./reactorTypes.ts').QuerySubResultInStorage} */
+      const jsonResult = {
+        ...meta,
+        store: s.toJSON(store),
+        attrsStore: attrsStore.toJSON(),
+      };
+      jsonSub.result = jsonResult;
+    }
   }
   return jsonSub;
 }
@@ -175,6 +259,10 @@ function kvFromStorage(key, x) {
   switch (key) {
     case 'pendingMutations':
       return new Map(typeof x === 'string' ? JSON.parse(x) : x);
+    case ATTRS_KEY: {
+      const parsed = typeof x === 'string' ? JSON.parse(x) : x;
+      return parsed ? s.attrsStoreFromJSON(parsed, null) : undefined;
+    }
     default:
       return x;
   }
@@ -184,6 +272,8 @@ function kvToStorage(key, x) {
   switch (key) {
     case 'pendingMutations':
       return [...x.entries()];
+    case ATTRS_KEY:
+      return x.toJSON();
     default:
       return x;
   }
@@ -449,17 +539,67 @@ export default class Reactor {
   }
 
   _onQuerySubLoaded(hash) {
-    this.kv
-      .waitForKeyToLoad('pendingMutations')
-      .then(() => this.notifyOne(hash));
+    Promise.all([
+      this.kv.waitForKeyToLoad('pendingMutations'),
+      this.kv.waitForKeyToLoad(ATTRS_KEY),
+    ]).then(() => this.notifyOne(hash));
+  }
+
+  _getSharedAttrsStore() {
+    return this.attrs || this.kv?.currentValue?.[ATTRS_KEY];
+  }
+
+  _hasUnhydratedQuerySubs() {
+    if (!this.querySubs) return false;
+    return Object.values(this.querySubs.currentValue).some((sub) =>
+      Boolean(sub?.result?._rawStore),
+    );
+  }
+
+  _ensureHydratedResult(result) {
+    if (!result) return null;
+    if (!result._rawStore) {
+      return result.store && result.attrsStore ? result : null;
+    }
+    const sharedAttrs = this._getSharedAttrsStore();
+    if (!sharedAttrs) return null;
+    const attrsStore = hydrateAttrsStore(sharedAttrs, result._extraAttrs);
+    const store = s.fromJSON(attrsStore, {
+      ...result._rawStore,
+      useDateObjects: this.config.useDateObjects,
+    });
+    result.store = store;
+    result.attrsStore = attrsStore;
+    delete result._rawStore;
+    delete result._extraAttrs;
+    return result;
+  }
+
+  _persistAttrs(attrsStore) {
+    if (!this.kv) return;
+    const existing = this.kv.currentValue[ATTRS_KEY];
+    if (
+      existing &&
+      areObjectsDeepEqual(existing.attrs, attrsStore.attrs) &&
+      areObjectsDeepEqual(existing.linkIndex, attrsStore.linkIndex)
+    ) {
+      return;
+    }
+    this.kv.updateInPlace((prev) => {
+      prev[ATTRS_KEY] = attrsStore;
+    });
   }
 
   _initStorage(Storage) {
     this.querySubs = new PersistedObject({
       persister: new Storage(this.config.appId, 'querySubs'),
       merge: onMergeQuerySub,
-      serialize: querySubToStorage,
-      parse: (_key, x) => querySubFromStorage(x, this.config.useDateObjects),
+      serialize: (key, sub) =>
+        querySubToStorage(key, sub, () => this._getSharedAttrsStore()),
+      parse: (_key, x) =>
+        querySubFromStorage(x, this.config.useDateObjects, () =>
+          this._getSharedAttrsStore(),
+        ),
       // objectSize
       objectSize: (x) => x?.result?.store?.triples?.length ?? 0,
       logger: this._log,
@@ -485,12 +625,13 @@ export default class Reactor {
       gc: null,
     });
     this.kv.onKeyLoaded = (k) => {
-      if (k === 'pendingMutations') {
+      if (k === 'pendingMutations' || k === ATTRS_KEY) {
         this.notifyAll();
       }
     };
-    // Trigger immediate load for pendingMutations and currentUser
+    // Trigger immediate load for pendingMutations, attrs, and currentUser
     this.kv.waitForKeyToLoad('pendingMutations');
+    this.kv.waitForKeyToLoad(ATTRS_KEY);
     this.kv.waitForKeyToLoad(currentUserKey);
     this._beforeUnloadCbs.push(() => {
       this.kv.flush();
@@ -1074,15 +1215,20 @@ export default class Reactor {
   }
 
   _setAttrs(attrs) {
-    this.attrs = new s.AttrsStoreClass(
+    const nextAttrs = new s.AttrsStoreClass(
       attrs.reduce((acc, attr) => {
         acc[attr.id] = attr;
         return acc;
       }, {}),
       this._linkIndex,
     );
+    this.attrs = nextAttrs;
+    this._persistAttrs(nextAttrs);
 
     this.notifyAttrsSubs();
+    if (this._hasUnhydratedQuerySubs()) {
+      this.notifyAll();
+    }
   }
 
   // ---------------------------
@@ -1413,7 +1559,8 @@ export default class Reactor {
     const pendingMutationsVersion = this.kv.version();
     const pendingMutations = this._pendingMutations();
 
-    const { q, result } = querySubs[hash] || {};
+    const { q, result: rawResult } = querySubs[hash] || {};
+    const result = this._ensureHydratedResult(rawResult);
     if (!result) return;
 
     const cached = this._dataForQueryCache[hash];
@@ -1504,8 +1651,10 @@ export default class Reactor {
   }
 
   loadedNotifyAll() {
-    this.kv
-      .waitForKeyToLoad('pendingMutations')
+    Promise.all([
+      this.kv.waitForKeyToLoad('pendingMutations'),
+      this.kv.waitForKeyToLoad(ATTRS_KEY),
+    ])
       .then(() => this.notifyAll())
       .catch(() => this.notifyAll());
   }
@@ -1534,9 +1683,9 @@ export default class Reactor {
         {
           attrsStore: this.optimisticAttrs(),
           schema: this.config.schema,
-          stores: Object.values(this.querySubs.currentValue).map(
-            (sub) => sub?.result?.store,
-          ),
+          stores: Object.values(this.querySubs.currentValue)
+            .map((sub) => this._ensureHydratedResult(sub?.result)?.store)
+            .filter(Boolean),
           useDateObjects: this.config.useDateObjects,
         },
         chunks,

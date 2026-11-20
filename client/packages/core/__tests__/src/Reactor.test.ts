@@ -478,3 +478,283 @@ test('getLocalId always returns the same id', async () => {
 
   expect(id).toStrictEqual([...ids][0]);
 });
+
+test('querySubs shares a single attrsStore in kv instead of duplicating attrs per query', async () => {
+  const appId = uuid();
+  const stores = new Map();
+  let kvAttrsWrites = 0;
+
+  class TrackingStorage {
+    constructor(_appId, storeName) {
+      if (!stores.has(storeName)) {
+        stores.set(storeName, new Map());
+      }
+      this.storeName = storeName;
+      this.map = stores.get(storeName);
+    }
+    async getItem(k) {
+      return this.map.get(k);
+    }
+    async removeItem(k) {
+      this.map.delete(k);
+    }
+    async multiSet(pairs) {
+      for (const [k, v] of pairs) {
+        if (this.storeName === 'kv' && k === 'attrs') {
+          kvAttrsWrites++;
+        }
+        this.map.set(k, v);
+      }
+    }
+    async getAllKeys() {
+      return [...this.map.keys()];
+    }
+  }
+
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(TrackingStorage);
+  reactor._setAttrs(zenecaAttrs);
+
+  const q1 = { users: {} };
+  const q2 = { bookshelves: {} };
+
+  await waitForLoaded(reactor);
+
+  for (const q of [q1, q2]) {
+    reactor.subscribeQuery(q, () => {});
+    reactor._handleReceive(0, {
+      op: 'add-query-ok',
+      q,
+      'processed-tx-id': 0,
+      result: [
+        {
+          data: {
+            'datalog-result': {
+              'join-rows': [zenecaTriples],
+            },
+          },
+          'child-nodes': [],
+        },
+      ],
+    });
+  }
+
+  await waitForLoaded(reactor);
+
+  // Shared attrs should be persisted once in kv
+  const kvStore = stores.get('kv');
+  const persistedAttrs = kvStore.get('attrs');
+  expect(persistedAttrs).toBeDefined();
+  expect(Object.keys(persistedAttrs.attrs).length).toBe(zenecaAttrs.length);
+  const writesAfterInitial = kvAttrsWrites;
+
+  // Calling _setAttrs again with identical attrs should not rewrite kv['attrs']
+  reactor._setAttrs(zenecaAttrs);
+  await reactor.kv.flush();
+  expect(kvAttrsWrites).toBe(writesAfterInitial);
+
+  // Persisted querySubs entries must NOT embed the full attrsStore
+  const querySubsStore = stores.get('querySubs');
+  const persistedQ1 = querySubsStore.get(weakHash(q1));
+  const persistedQ2 = querySubsStore.get(weakHash(q2));
+  expect(persistedQ1?.result?.store?.triples?.length).toBeGreaterThan(0);
+  expect(persistedQ1?.result?.attrsStore).toBeUndefined();
+  expect(persistedQ2?.result?.attrsStore).toBeUndefined();
+
+  // Cold offline restart (no _setAttrs call!) hydrates both queries from shared kv['attrs']
+  // even when kv['attrs'] finishes loading AFTER querySubs.
+  class DelayedKvAttrsStorage extends TrackingStorage {
+    async getItem(k) {
+      if (this.storeName === 'kv' && k === 'attrs') {
+        await sleep(30);
+      }
+      return super.getItem(k);
+    }
+  }
+
+  const reactor2 = new Reactor({ appId });
+  reactor2._initStorage(DelayedKvAttrsStorage);
+
+  const res1 = await new Promise((resolve, reject) => {
+    reactor2.subscribeQuery(q1, (res) => {
+      if (res.error) reject(res.error);
+      else if (res.data) resolve(res);
+    });
+  });
+
+  expect(res1.data.users.map((x) => x.handle)).toEqual([
+    'joe',
+    'alex',
+    'stopa',
+    'nicolegf',
+  ]);
+});
+
+test('querySubs still loads legacy entries with embedded attrsStore', async () => {
+  const appId = uuid();
+  const q = { users: {} };
+  const hash = weakHash(q);
+  const stores = new Map();
+
+  class MemStorage {
+    constructor(_appId, storeName) {
+      if (!stores.has(storeName)) {
+        stores.set(storeName, new Map());
+      }
+      this.map = stores.get(storeName);
+    }
+    async getItem(k) {
+      return this.map.get(k);
+    }
+    async removeItem(k) {
+      this.map.delete(k);
+    }
+    async multiSet(pairs) {
+      for (const [k, v] of pairs) {
+        this.map.set(k, v);
+      }
+    }
+    async getAllKeys() {
+      return [...this.map.keys()];
+    }
+  }
+
+  // Seed a legacy querySub entry containing embedded attrsStore and NO kv['attrs']
+  const querySubsMap = new Map();
+  querySubsMap.set('__meta', {
+    objects: {
+      [hash]: { createdAt: Date.now(), updatedAt: Date.now(), size: 1 },
+    },
+  });
+  querySubsMap.set(hash, {
+    q,
+    result: {
+      store: {
+        triples: zenecaTriples,
+        cardinalityInference: false,
+        useDateObjects: false,
+        version: 1,
+      },
+      attrsStore: zenecaAttrsStore.toJSON(),
+      processedTxId: 0,
+    },
+  });
+  stores.set('querySubs', querySubsMap);
+  const kvMap = new Map();
+  kvMap.set('pendingMutations', []);
+  stores.set('kv', kvMap);
+
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(MemStorage);
+
+  const res = await new Promise((resolve, reject) => {
+    reactor.subscribeQuery(q, (r) => {
+      if (r.error) reject(r.error);
+      else if (r.data) resolve(r);
+    });
+  });
+
+  expect(res.data.users.map((x) => x.handle)).toEqual([
+    'joe',
+    'alex',
+    'stopa',
+    'nicolegf',
+  ]);
+});
+
+test('querySubs preserves optimistic extraAttrs across storage round-trip', async () => {
+  const appId = uuid();
+  const stores = new Map();
+
+  class MemStorage {
+    constructor(_appId, storeName) {
+      if (!stores.has(storeName)) {
+        stores.set(storeName, new Map());
+      }
+      this.map = stores.get(storeName);
+    }
+    async getItem(k) {
+      return this.map.get(k);
+    }
+    async removeItem(k) {
+      this.map.delete(k);
+    }
+    async multiSet(pairs) {
+      for (const [k, v] of pairs) {
+        this.map.set(k, v);
+      }
+    }
+    async getAllKeys() {
+      return [...this.map.keys()];
+    }
+  }
+
+  const reactor = new Reactor({ appId });
+  reactor._initStorage(MemStorage);
+  reactor._setAttrs(zenecaAttrs);
+  await waitForLoaded(reactor);
+
+  const q = { users: {} };
+  reactor.subscribeQuery(q, () => {});
+  reactor._handleReceive(0, {
+    op: 'add-query-ok',
+    q,
+    'processed-tx-id': 0,
+    result: [
+      {
+        data: {
+          'datalog-result': {
+            'join-rows': [zenecaTriples],
+          },
+        },
+        'child-nodes': [],
+      },
+    ],
+  });
+
+  // Push an optimistic mutation introducing a brand-new attribute not in zenecaAttrs
+  const joeId = 'ce942051-2d74-404a-9c7d-4aa3f2d54ae4';
+  reactor.pushTx([instatx.tx.users[joeId].update({ nickname: 'joey' })]);
+
+  // Simulate refresh-ok before server has the new attr in msg.attrs
+  reactor._handleReceive(1, {
+    op: 'refresh-ok',
+    'processed-tx-id': 1,
+    attrs: zenecaAttrs,
+    computations: [
+      {
+        'instaql-query': q,
+        'instaql-result': [
+          {
+            data: {
+              'datalog-result': {
+                'join-rows': [zenecaTriples],
+              },
+            },
+            'child-nodes': [],
+          },
+        ],
+      },
+    ],
+  });
+
+  await waitForLoaded(reactor);
+
+  const persisted = stores.get('querySubs').get(weakHash(q));
+  expect(persisted.result.attrsStore).toBeUndefined();
+  expect(Object.keys(persisted.result.extraAttrs || {}).length).toBe(1);
+
+  // Reload offline: nickname should still be readable
+  const reactor2 = new Reactor({ appId });
+  reactor2._initStorage(MemStorage);
+
+  const res = await new Promise((resolve, reject) => {
+    reactor2.subscribeQuery(q, (r) => {
+      if (r.error) reject(r.error);
+      else if (r.data) resolve(r);
+    });
+  });
+
+  const joe = res.data.users.find((u) => u.id === joeId);
+  expect(joe.nickname).toBe('joey');
+});
