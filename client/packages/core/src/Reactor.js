@@ -324,6 +324,8 @@ export default class Reactor {
 
   /** @type {Record<string, Array<{ q: any, cb: (data: any) => any }>>} */
   queryCbs = {};
+  /** @type {Map<string, { serverStore: s.Store, version: number, pageInfo: any, aggregate: any }>} */
+  _serverQueryBases = new Map();
   /** @type {Record<string, Array<{ q: any, eventId: string, dfd: Deferred }>>} */
   queryOnceDfds = {};
   authCbs = [];
@@ -495,6 +497,7 @@ export default class Reactor {
             STATUS.CLOSED,
           );
           this._setStatus(STATUS.CLOSED);
+    this._serverQueryBases.clear();
         }
       });
     });
@@ -819,6 +822,16 @@ export default class Reactor {
           enableCardinalityInference,
           this.config.useDateObjects,
         );
+        if (typeof msg.version === 'number') {
+          this._serverQueryBases.set(hash, {
+            serverStore: store,
+            version: msg.version,
+            pageInfo,
+            aggregate,
+          });
+        } else {
+          this._serverQueryBases.delete(hash);
+        }
 
         this.querySubs.updateInPlace((prev) => {
           if (!prev[hash]) {
@@ -897,18 +910,67 @@ export default class Reactor {
 
         const mutations = sortedMutationEntries(rewrittenMutations.entries());
 
-        const updates = computations.map((x) => {
+        const resubscribeQueries = [];
+        const updates = [];
+
+        for (const x of computations) {
           const q = x['instaql-query'];
           const result = x['instaql-result'];
+          const delta = x['instaql-delta'];
           const hash = weakHash(q);
-          const triples = extractTriples(result);
           const attrsStore = this.ensureAttrs();
-          const store = s.createStore(
-            attrsStore,
-            triples,
-            enableCardinalityInference,
-            this.config.useDateObjects,
-          );
+          let store;
+          let pageInfo;
+          let aggregate;
+
+          if (delta) {
+            const base = this._serverQueryBases.get(hash);
+            if (!base || base.version !== delta['base-version']) {
+              // Delta base-version mismatch (e.g. cold cache or out-of-order frame):
+              // clear stale base and request a fresh full snapshot.
+              this._serverQueryBases.delete(hash);
+              resubscribeQueries.push(q);
+              continue;
+            }
+            store = s.applyTriplesDelta(base.serverStore, attrsStore, delta);
+            pageInfo =
+              delta['page-info'] !== undefined
+                ? delta['page-info']
+                : base.pageInfo;
+            aggregate =
+              delta['aggregate'] !== undefined
+                ? delta['aggregate']
+                : base.aggregate;
+            if (typeof x.version === 'number') {
+              this._serverQueryBases.set(hash, {
+                serverStore: store,
+                version: x.version,
+                pageInfo,
+                aggregate,
+              });
+            }
+          } else {
+            const triples = extractTriples(result);
+            store = s.createStore(
+              attrsStore,
+              triples,
+              enableCardinalityInference,
+              this.config.useDateObjects,
+            );
+            pageInfo = result?.[0]?.data?.['page-info'];
+            aggregate = result?.[0]?.data?.['aggregate'];
+            if (typeof x.version === 'number') {
+              this._serverQueryBases.set(hash, {
+                serverStore: store,
+                version: x.version,
+                pageInfo,
+                aggregate,
+              });
+            } else {
+              this._serverQueryBases.delete(hash);
+            }
+          }
+
           const { store: newStore, attrsStore: newAttrsStore } =
             this._applyOptimisticUpdates(
               store,
@@ -916,17 +978,20 @@ export default class Reactor {
               mutations,
               processedTxId,
             );
-          const pageInfo = result?.[0]?.data?.['page-info'];
-          const aggregate = result?.[0]?.data?.['aggregate'];
-          return {
+          updates.push({
             q,
             hash,
             store: newStore,
             attrsStore: newAttrsStore,
             pageInfo,
             aggregate,
-          };
-        });
+          });
+        }
+
+        for (const q of resubscribeQueries) {
+          this._trySendAuthed(uuid(), { op: 'remove-query', q });
+          this._trySendAuthed(uuid(), { op: 'add-query', q });
+        }
 
         updates.forEach(
           ({ hash, q, store, attrsStore, pageInfo, aggregate }) => {
@@ -1395,6 +1460,7 @@ export default class Reactor {
     delete this.queryCbs[hash];
     delete this.queryOnceDfds[hash];
     delete this._dataForQueryCache[hash];
+    this._serverQueryBases.delete(hash);
     this.querySubs.unloadKey(hash);
 
     this._trySendAuthed(uuid(), { op: 'remove-query', q });
@@ -1913,6 +1979,10 @@ export default class Reactor {
           'app-id': this.config.appId,
           'refresh-token': resp.user?.['refresh_token'],
           versions: this.versions,
+          features:
+            this.config.enableRefreshDelta === false
+              ? undefined
+              : ['refresh-delta'],
           // If an admin token is provided for an app, we will
           // skip all permission checks. This is an advanced feature,
           // to let users write internal tools
@@ -2002,6 +2072,7 @@ export default class Reactor {
     }
 
     this._setStatus(STATUS.CLOSED);
+    this._serverQueryBases.clear();
 
     for (const room of Object.values(this._rooms)) {
       room.isConnected = false;

@@ -700,6 +700,43 @@
               (is (= :refresh-ok (:op ret)))
               (is (not (contains? ret :attrs))))))))))
 
+(deftest admin-refresh-delta-feature
+  ;; Admin sessions that pass :features ["refresh-delta"] receive instaql-delta
+  ;; payloads on refresh-ok for join-rows queries.
+  (with-movies-app
+    (fn [{app-id :id :as app} r]
+      (with-session
+        (fn [store {{sess-id :id :as socket} :socket}]
+          (session/admin-init! store sess-id {:app app
+                                              :attrs (attr-model/get-by-app-id app-id)
+                                              :admin? true
+                                              :inference? false
+                                              :creator {:id (random-uuid)}
+                                              :versions {session/core-version-key "v1.0.65"}
+                                              :features ["refresh-delta"]})
+          (let [robocop-eid (resolvers/->uuid r "eid-robocop")
+                title-attr-id (resolvers/->uuid r :movie/title)
+                q (:kw-q query-1987)
+                {base-version :version} (blocking-send-msg :add-query-ok socket {:op :add-query :q q})]
+            (is (number? base-version))
+            (blocking-send-msg :transact-ok
+                               socket
+                               {:op :transact
+                                :tx-steps [["add-triple" robocop-eid title-attr-id "RoboAdminDelta"]]})
+            (rs/mark-stale-topics! store
+                                   app-id
+                                   0
+                                   (instant.isn/test-isn 0)
+                                   [(d/pat->coarse-topic [:ea robocop-eid])]
+                                   {})
+            (send-msg socket {:session-id sess-id :op :refresh})
+            (let [{[computation] :computations :as ret} (read-msg socket)
+                  delta (:instaql-delta computation)]
+              (is (= :refresh-ok (:op ret)))
+              (is (not (contains? computation :instaql-result)))
+              (is (= base-version (:base-version delta)))
+              (is (= 1 (count (:added delta)))))))))))
+
 (deftest refresh-sends-attrs-when-schema-changes-without-queries
   (with-session
     (fn [_store {:keys [socket movies-app-id]}]

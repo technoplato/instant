@@ -312,6 +312,125 @@ export function hasEntity(store: Store, e: string) {
   return getInMap(store.eav, [e]) !== undefined;
 }
 
+export type TriplesDelta = {
+  'base-version'?: number;
+  added?: Triple[];
+  removed?: Triple[];
+  'removed-entities'?: string[];
+  'page-info'?: any;
+  aggregate?: any;
+};
+
+function deleteEntityFromIndexes(
+  store: Store,
+  attrsStore: AttrsStore,
+  eid: string,
+): void {
+  const eMap = store.eav.get(eid);
+  if (eMap) {
+    for (const [aid, valMap] of eMap.entries()) {
+      const attr = attrsStore.getAttr(aid);
+      if (attr && isRef(attr)) {
+        for (const v of valMap.keys()) {
+          deleteInMap(store.vae, [v, aid, eid]);
+        }
+      }
+      deleteInMap(store.aev, [aid, eid]);
+    }
+    store.eav.delete(eid);
+  }
+}
+
+function addServerTriple(
+  store: Store,
+  attrsStore: AttrsStore,
+  rawTriple: Triple,
+): void {
+  let [eid, aid, v, t] = rawTriple;
+  const attr = attrsStore.getAttr(aid);
+  if (!attr) {
+    return;
+  }
+
+  if (attr['checked-data-type'] === 'date' && store.useDateObjects) {
+    v = coerceToDate(v);
+  }
+
+  const triple: Triple = [eid, aid, v, t];
+
+  if (hasEA(attr)) {
+    // Retract any stale vae index entry when replacing a cardinality-one ref
+    if (isRef(attr)) {
+      const oldVals = store.eav.get(eid)?.get(aid);
+      if (oldVals) {
+        for (const oldV of oldVals.keys()) {
+          if (oldV !== v) {
+            deleteInMap(store.vae, [oldV, aid, eid]);
+          }
+        }
+      }
+    }
+    setInMap(store.eav, [eid, aid], new Map([[v, triple]]));
+    setInMap(store.aev, [aid, eid], new Map([[v, triple]]));
+  } else {
+    setInMap(store.eav, [eid, aid, v], triple);
+    setInMap(store.aev, [aid, eid, v], triple);
+  }
+
+  if (isRef(attr)) {
+    setInMap(store.vae, [v, aid, eid], triple);
+  }
+}
+
+/**
+ * Applies a server-computed `instaql-delta` incrementally onto a previously
+ * materialized server Store in O(|delta|) time without rebuilding unchanged
+ * EAV/AEV/VAE index entries.
+ *
+ * Contract (matching server `instant.reactive.session/triples-delta`):
+ * 1. Drop every triple of each entity in `removed-entities`.
+ * 2. Drop each triple in `removed`.
+ * 3. Add each triple in `added` (cardinality-one values replace existing values).
+ */
+export function applyTriplesDelta(
+  store: Store,
+  attrsStore: AttrsStore,
+  delta: TriplesDelta,
+): Store {
+  return create(store, (draft) => {
+    const removedEntities = delta['removed-entities'];
+    if (removedEntities && removedEntities.length > 0) {
+      for (const eid of removedEntities) {
+        deleteEntityFromIndexes(draft, attrsStore, eid);
+      }
+    }
+
+    const removed = delta.removed;
+    if (removed && removed.length > 0) {
+      for (const rawTriple of removed) {
+        let [eid, aid, v] = rawTriple;
+        const attr = attrsStore.getAttr(aid);
+        if (!attr) continue;
+        if (attr['checked-data-type'] === 'date' && draft.useDateObjects) {
+          v = coerceToDate(v);
+        }
+        deleteInMap(draft.eav, [eid, aid, v]);
+        deleteInMap(draft.aev, [aid, eid, v]);
+        if (isRef(attr)) {
+          deleteInMap(draft.vae, [v, aid, eid]);
+        }
+      }
+    }
+
+    const added = delta.added;
+    if (added && added.length > 0) {
+      for (const triple of added) {
+        addServerTriple(draft, attrsStore, triple);
+      }
+    }
+  });
+}
+
 export function createStore(
   attrsStore: AttrsStore,
   triples: Triple[],

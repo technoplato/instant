@@ -230,7 +230,8 @@
            :session/auth auth
            :session/creator creator
            :session/inference? (:inference? ctx)
-           :session/features (get-supported-features (:versions ctx))
+           :session/features (into (get-supported-features (:versions ctx))
+                                   (requested-features ctx))
            (concat (when-let [versions (:versions ctx)]
                      [:session/versions versions])
                    [:session/attrs-hash (hash attrs)]))))
