@@ -26,17 +26,17 @@
 <p>
 
 > [!IMPORTANT]
-> **Experiment Branch: `experiment/death-scribe-streaming-perf`**
+> **This is a fork of [instantdb/instant](https://github.com/instantdb/instant): upstream `main` plus our changes.** See [FORK.md](FORK.md).
 >
-> This branch is an experimental fork rebased on `upstream/main` (`15358ad7`) targeting high-frequency append-only message logs (DEATH) and live streaming transcription updates (Scribe). Upstream branches are preserved untouched.
+> This fork's `main` is upstream `main` (`15358ad7`) plus changes targeting high-frequency append-only message logs (DEATH) and live streaming transcription updates (Scribe). Upstream is merged in, never rebased.
 >
-> **Optimizations included on this branch:**
+> **Optimizations included:**
 > 1. **Server & Client `refresh-delta` (`instaql-delta` + `applyTriplesDelta`):** Sessions advertising `features: ["refresh-delta"]` (both WebSocket `init` and Admin SSE `admin-init!`) receive minimal triple deltas (`added`, `removed`, `removed-entities`, omitting replaced cardinality-one old values) instead of re-sending full query results on every refresh. `@instantdb/core` (`store.ts` + `Reactor.js`) patches EAV/AEV/VAE indexes incrementally in `O(|delta|)` with copy-on-write immutability and automatic resubscribe fallback on `base-version` mismatch.
 > 2. **Admin SSE `attrs` skip (`admin-init!`):** Admin `subscribeQuery` sessions honor `:session/features` from client `versions`, stopping repeated ~854 KB `attrs` catalog resends on every refresh.
 > 3. **Deduplicated client KV `attrsStore`:** Persists one shared `attrsStore` in KV storage instead of duplicating it across every persisted `querySub`.
-> 4. **Upstream self-hosting fixes (`15358ad7`):** Includes `#2935` (stops self-hosted `:dev` WAL-buffer OOM, caps sketch cache at 256), `#2929` (bounded NIO heap), `#2950` (paged numeric range early-stop), and `#2925` (compressed `/admin/query`).
+> 4. **Upstream self-hosting fixes (`15358ad7`):** Includes `instantdb/instant#2935` (stops self-hosted `:dev` WAL-buffer OOM, caps sketch cache at 256), `instantdb/instant#2929` (bounded NIO heap), `instantdb/instant#2950` (paged numeric range early-stop), and `instantdb/instant#2925` (compressed `/admin/query`).
 >
-> **Measured Benchmarks (`bun scripts/bench-refresh-delta.mjs`, M5 Pro arm64, zero regressions: 17/17 Vitest suites, 214 passed / 1 skipped):**
+> **Measured Benchmarks (`bun scripts/bench-refresh-delta.mjs`, Apple M5 Pro, arm64, zero regressions: 17/17 Vitest suites, 214 passed / 1 skipped):**
 >
 > | Workload (DEATH log / Scribe stream) | Baseline Wire Bytes (full `instaql-result`) | Experiment Wire Bytes (`instaql-delta`) | Wire Reduction | Baseline Parse+Apply | Experiment Parse+Apply | Speedup |
 > |---|---:|---:|---:|---:|---:|---:|
@@ -44,7 +44,7 @@
 > | 5,000 existing rows, 25 appends | 36,041,900 B (36.04 MB) | 11,283 B (11.3 KB) | **99.97%** | 187.54 ms | 8.95 ms | **21.0x** |
 > | 10,000 existing rows, 10 appends | 28,795,270 B (28.80 MB) | 4,523 B (4.5 KB) | **99.98%** | 169.01 ms | 3.20 ms | **52.8x** |
 >
-> **Self-hosting target:** Runs bare-process (no Docker required) with PostgreSQL 17 (`wal_level=logical`) + standalone JVM JAR on both Apple Silicon laptops/M5 and Google Colab via SSH-over-WebSocket tunnels.
+> **Self-hosting target:** Runs bare-process (no Docker required) with PostgreSQL 17 (`wal_level=logical`) + standalone JVM JAR on both Apple Silicon Macs and Google Colab via SSH-over-WebSocket tunnels.
 
 Instant is the best backend for AI-coded apps. You get auth, permissions, storage, presence, and streams — everything you need to ship apps your users will love.
 
