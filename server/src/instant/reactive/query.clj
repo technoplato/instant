@@ -167,8 +167,9 @@
 (defn instaql-query-reactive!
   "Returns the result of an instaql query while producing book-keeping side
   effects in the store. Refreshes with :skip-unchanged-result? can omit unchanged
-  payloads and metadata for an explicitly enabled app/query cohort."
-  [store {:keys [session-id app-id attrs skip-unchanged-result?] :as base-ctx} instaql-query return-type inference?]
+  payloads and metadata for an explicitly enabled app/query cohort. Callers that
+  need the monotonic query version pass :include-version? true."
+  [store {:keys [session-id app-id attrs skip-unchanged-result? include-version?] :as base-ctx} instaql-query return-type inference?]
   (tracer/with-span! {:name "instaql-query-reactive!"
                       :attributes {:session-id session-id
                                    :app-id app-id
@@ -199,18 +200,18 @@
             materialize? (or result-changed?
                              (not skip-unchanged-result?)
                              (not (skip-unchanged-result-enabled? app-id instaql-query)))]
-        {:instaql-result (when materialize?
-                           (case return-type
-                             :join-rows (if (transient-triple-collection-enabled? app-id instaql-query)
-                                          (collect-instaql-results-with-transients instaql-result)
-                                          (collect-instaql-results-for-client instaql-result))
-                             :tree (instaql-nodes->object-tree (assoc ctx :inference? inference?) instaql-result)
-                             (collect-instaql-results-for-client instaql-result)))
-         :result-meta (when (and materialize? (= :tree return-type))
-                        (instaql-nodes->object-meta instaql-result))
-         :result-changed? result-changed?
-         :version v
-         :instaql-topic? (boolean iq-topic)})
+        (cond-> {:instaql-result (when materialize?
+                                   (case return-type
+                                     :join-rows (if (transient-triple-collection-enabled? app-id instaql-query)
+                                                  (collect-instaql-results-with-transients instaql-result)
+                                                  (collect-instaql-results-for-client instaql-result))
+                                     :tree (instaql-nodes->object-tree (assoc ctx :inference? inference?) instaql-result)
+                                     (collect-instaql-results-for-client instaql-result)))
+                 :result-meta (when (and materialize? (= :tree return-type))
+                                (instaql-nodes->object-meta instaql-result))
+                 :result-changed? result-changed?
+                 :instaql-topic? (boolean iq-topic)}
+          include-version? (assoc :version v)))
       (catch Throwable e
         (rs/remove-query! store app-id session-id instaql-query)
         (throw e)))))

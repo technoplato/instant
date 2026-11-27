@@ -315,17 +315,19 @@
             processed-isn (rs/get-processed-isn store app-id)
             {:keys [table-info]} (get-attrs app)
             attrs (attr-model/get-by-app-id app-id)
-            ctx {:db {:conn-pool (aurora/conn-pool (db-read-level app-id))}
-                 :datalog-loader (rs/upsert-datalog-loader! store sess-id d/make-loader)
-                 :session-id     sess-id
-                 :app-id         app-id
-                 :attrs          attrs
-                 :table-info     table-info
-                 :admin?         admin?
-                 :current-user   user}
             {:keys [session/inference? session/features]} (rs/session store sess-id)
+            refresh-delta? (supports-refresh-delta? features)
+            ctx (cond-> {:db {:conn-pool (aurora/conn-pool (db-read-level app-id))}
+                         :datalog-loader (rs/upsert-datalog-loader! store sess-id d/make-loader)
+                         :session-id     sess-id
+                         :app-id         app-id
+                         :attrs          attrs
+                         :table-info     table-info
+                         :admin?         admin?
+                         :current-user   user}
+                  refresh-delta? (assoc :include-version? true))
             {:keys [instaql-result result-meta version]} (rq/instaql-query-reactive! store ctx q return-type inference?)
-            delta-triples (when (supports-refresh-delta? features)
+            delta-triples (when refresh-delta?
                             (join-rows-triples instaql-result))]
         (when delta-triples
           (rs/record-instaql-query-sent! store app-id sess-id q version delta-triples))
@@ -512,28 +514,30 @@
   [{:keys [store current-user app-id sess-id attrs table-info admin?]}
    {:keys [instaql-query/query instaql-query/return-type
            instaql-query/forms-hash]}]
-  (let [ctx {:db {:conn-pool (aurora/conn-pool (db-read-level app-id))}
-             :skip-unchanged-result? true
-             :session-id sess-id
-             :app-id app-id
-             :attrs attrs
-             ;; Will only be present for byop apps
-             :table-info table-info
-             :current-user current-user
-             :admin? admin?}
+  (let [{:keys [session/inference? session/features]} (rs/session store sess-id)
+        refresh-delta? (supports-refresh-delta? features)
+        ctx (cond-> {:db {:conn-pool (aurora/conn-pool (db-read-level app-id))}
+                     :skip-unchanged-result? true
+                     :session-id sess-id
+                     :app-id app-id
+                     :attrs attrs
+                     ;; Will only be present for byop apps
+                     :table-info table-info
+                     :current-user current-user
+                     :admin? admin?}
+              refresh-delta? (assoc :include-version? true))
         start-ms (System/currentTimeMillis)
-        {:keys [session/inference?]} (rs/session store sess-id)
         {:keys [instaql-result result-meta result-changed? instaql-topic? version]}
         (rq/instaql-query-reactive! store ctx query return-type inference?)
         end-ms (System/currentTimeMillis)]
-    {:instaql-query query
-     :instaql-query-hash forms-hash
-     :instaql-result instaql-result
-     :result-meta result-meta
-     :result-changed? result-changed?
-     :version version
-     :duration-ms (- end-ms start-ms)
-     :instaql-topic? instaql-topic?}))
+    (cond-> {:instaql-query query
+             :instaql-query-hash forms-hash
+             :instaql-result instaql-result
+             :result-meta result-meta
+             :result-changed? result-changed?
+             :duration-ms (- end-ms start-ms)
+             :instaql-topic? instaql-topic?}
+      refresh-delta? (assoc :version version))))
 
 (defn- handle-refresh! [store sess-id event debug-info]
   (e2e-tracer/invalidator-tracking-step! {:tx-id (:tx-id event)

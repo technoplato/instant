@@ -617,7 +617,7 @@
                 title-attr-id (resolvers/->uuid r :movie/title)
                 q (:kw-q query-1987)
                 {base-version :version} (blocking-send-msg :add-query-ok socket {:op :add-query :q q})
-                _ (blocking-send-msg :add-query-ok socket-2 {:op :add-query :q q})
+                add-query-ok-2 (blocking-send-msg :add-query-ok socket-2 {:op :add-query :q q})
                 refresh! (fn [socket sess-id]
                            (rs/mark-stale-topics! store
                                                   app-id
@@ -629,6 +629,9 @@
                            (read-msg socket))
                 e+a+v (fn [triples] (set (map #(vec (take 3 %)) triples)))]
             (is (number? base-version))
+            (is (= base-version (get-in @*instaql-query-results* [sess-id q :version])))
+            (is (not (contains? add-query-ok-2 :version)))
+            (is (not (contains? (get-in @*instaql-query-results* [sess-id-2 q]) :version)))
             (blocking-send-msg :transact-ok
                                socket
                                {:op :transact
@@ -638,9 +641,12 @@
               (let [{[computation] :computations :as ret} (refresh! socket sess-id)
                     delta (:instaql-delta computation)]
                 (is (= :refresh-ok (:op ret)))
+                (is (not (contains? ret :attrs)))
                 (is (not (contains? computation :instaql-result)))
                 (is (= base-version (:base-version delta)))
                 (is (< base-version (:version computation)))
+                (is (= (:version computation)
+                       (get-in @*instaql-query-results* [sess-id q :version])))
                 (is (= #{[robocop-eid title-attr-id "RoboDrizzle"]} (e+a+v (:added delta))))
                 (testing "a new value of a cardinality-one attribute replaces the old one unsent"
                   (is (empty? (:removed delta))))))
@@ -657,10 +663,13 @@
                 (is (empty? (:added delta)))))
 
             (testing "a session that did not ask still gets the whole result"
-              (let [{[computation] :computations} (refresh! socket-2 sess-id-2)]
+              (let [{[computation] :computations :as ret} (refresh! socket-2 sess-id-2)]
+                (is (= :refresh-ok (:op ret)))
+                (is (not (contains? ret :attrs)))
                 (is (contains? computation :instaql-result))
                 (is (not (contains? computation :instaql-delta)))
-                (is (not (contains? computation :version)))))))))))
+                (is (not (contains? computation :version)))
+                (is (not (contains? (get-in @*instaql-query-results* [sess-id-2 q]) :version)))))))))))
 
 (deftest admin-refresh-skip-attrs
   ;; @instantdb/admin's subscribeQuery starts its session with admin-init!,
@@ -733,9 +742,30 @@
             (let [{[computation] :computations :as ret} (read-msg socket)
                   delta (:instaql-delta computation)]
               (is (= :refresh-ok (:op ret)))
+              (is (not (contains? ret :attrs)))
               (is (not (contains? computation :instaql-result)))
               (is (= base-version (:base-version delta)))
+              (is (< base-version (:version computation)))
+              (is (= (:version computation)
+                     (get-in @*instaql-query-results* [sess-id q :version])))
               (is (= 1 (count (:added delta)))))))))))
+
+(deftest instaql-query-reactive-version-opt-in
+  (let [app-id (random-uuid)
+        session-id (random-uuid)
+        store (rs/init)
+        ctx {:app-id app-id
+             :session-id session-id
+             :attrs (attr-model/wrap-attrs [])}
+        q {:items {}}]
+    (with-redefs [flags/toggled? (constantly false)
+                  iq/permissioned-query (constantly [])]
+      (let [without-version (rq/instaql-query-reactive! store ctx q :join-rows true)
+            with-version (rq/instaql-query-reactive! store (assoc ctx :include-version? true) q :join-rows true)
+            next-version (rq/instaql-query-reactive! store (assoc ctx :include-version? true) q :join-rows true)]
+        (is (not (contains? without-version :version)))
+        (is (= 2 (:version with-version)))
+        (is (= 3 (:version next-version)))))))
 
 (deftest refresh-sends-attrs-when-schema-changes-without-queries
   (with-session
